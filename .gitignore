@@ -1,0 +1,17 @@
+# بيانات سرية — لا ترفع أبداً
+.env
+
+# مجلد الحزم
+node_modules/
+
+# ملفات النظام
+.DS_Store
+Thumbs.db
+
+# سجلات
+*.log
+npm-debug.log*
+
+# ملفات مؤقتة
+*.tmp
+*.bak

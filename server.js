@@ -67,6 +67,27 @@ async function initDB() {
         created_at  TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(source, bank_name)
       );
+
+      -- ══════════════════════════════════════════════
+      --  جداول النظام الموحد (واجهة index.html)
+      -- ══════════════════════════════════════════════
+
+      -- تخزين عام للسجلات (tx, files, issues, debts)
+      CREATE TABLE IF NOT EXISTS app_records (
+        store      VARCHAR(20) NOT NULL,
+        id         TEXT        NOT NULL,
+        data       JSONB       NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (store, id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_app_records_store ON app_records(store);
+
+      -- تخزين عام للإعدادات (aliases, manual entries, ...)
+      CREATE TABLE IF NOT EXISTS app_config (
+        key        TEXT PRIMARY KEY,
+        value      JSONB,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     console.log('✅ الجداول جاهزة');
   } catch (err) {
@@ -228,6 +249,114 @@ app.post('/api/bank-identity', async (req, res) => {
       RETURNING *
     `, [source, bank_name, customer_id || null]);
     res.json({ ok: true, data: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════
+//  API: تخزين عام للنظام الموحد (tx / files / issues / debts / cfg)
+// ══════════════════════════════════════════════════
+
+const VALID_STORES = ['tx', 'files', 'issues', 'debts'];
+
+function checkStore(req, res, next) {
+  if (!VALID_STORES.includes(req.params.store)) {
+    return res.status(400).json({ error: 'مخزن غير صالح' });
+  }
+  next();
+}
+
+// جلب جميع السجلات في مخزن معيّن
+app.get('/api/store/:store', checkStore, async (req, res) => {
+  try {
+    const rows = await pool.query(
+      'SELECT data FROM app_records WHERE store = $1',
+      [req.params.store]
+    );
+    res.json({ ok: true, data: rows.rows.map(r => r.data) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// إضافة/تحديث سجلات (upsert) بشكل دفعي
+app.post('/api/store/:store/batch', checkStore, async (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: 'items يجب أن تكون مصفوفة' });
+  }
+  if (!items.length) return res.json({ ok: true, count: 0 });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const item of items) {
+      if (!item || item.id == null) continue;
+      await client.query(`
+        INSERT INTO app_records (store, id, data, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (store, id) DO UPDATE SET data = $3, updated_at = NOW()
+      `, [req.params.store, String(item.id), JSON.stringify(item)]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, count: items.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// حذف سجلات تطابق شرطاً: { field: 'fileId', values: [...] } أو { field:'id', values:[...] }
+app.post('/api/store/:store/delete-where', checkStore, async (req, res) => {
+  const { field, values } = req.body;
+  if (!field || !Array.isArray(values) || !values.length) {
+    return res.status(400).json({ error: 'field و values مطلوبة' });
+  }
+  try {
+    const result = await pool.query(
+      `DELETE FROM app_records
+       WHERE store = $1
+       AND data->>$2 = ANY($3::text[])`,
+      [req.params.store, field, values.map(String)]
+    );
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// مسح كامل مخزن
+app.delete('/api/store/:store', checkStore, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM app_records WHERE store = $1', [req.params.store]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── إعدادات عامة (aliases, manual_entries, ...) ──
+app.get('/api/cfg/:key', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT value FROM app_config WHERE key = $1', [req.params.key]);
+    res.json({ ok: true, value: result.rows[0]?.value ?? null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/cfg/:key', async (req, res) => {
+  const { value } = req.body;
+  try {
+    await pool.query(`
+      INSERT INTO app_config (key, value, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()
+    `, [req.params.key, JSON.stringify(value ?? null)]);
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
