@@ -1156,8 +1156,7 @@ const OWNER_NAMES = [
   'mohyeieldeen mohamad mohamod abu garqood','mohyeieldeen a alastal'
 ];
 
-const DB_NAME = 'UnifiedFinanceDB_v2';
-let db = null;
+// (متغيرات IDB أُزيلت - النظام يعمل عبر API)
 let TX = [], FILES = [], ALIASES = {}, ISSUES = [], DEBTS = [];
 let currentSource = 'all';
 let currentView = 'details';
@@ -1169,150 +1168,70 @@ let aliasTarget = null;
 let deleteTarget = null;
 let aliasDrafts = {};
 
-// ===== طبقة التخزين الثلاثية: IDB → localStorage → in-memory =====
-// storageMode: 'idb' | 'ls' | 'mem'
-let storageMode = 'idb';
-const LS_PRE = 'ufs2_';
+// ===== طبقة التخزين: API (PostgreSQL عبر السيرفر) =====
+// جميع البيانات تُخزَّن في قاعدة البيانات المركزية على الخادم
+// وتُكَشَّف للواجهة عبر /api/store/:store و /api/cfg/:key
 
-// --- اختبار localStorage: هل هو متاح فعلاً؟ ---
-function isLocalStorageAvailable(){
-  try{
-    const k = '__ufs_test__';
-    localStorage.setItem(k,'1');
-    localStorage.removeItem(k);
-    return true;
-  }catch{ return false; }
-}
+const API_BASE = '';  // نفس الأصل (same-origin)
 
-// --- in-memory store (الطبقة الاحتياطية الأخيرة) ---
-const _mem = { tx:[], files:[], issues:[], debts:[], cfg:{} };
-
-/* --- localStorage backend --- */
-let _lsSizeCache = {size: null, ts: 0};
-function lsCalcSize(){
-  const now = Date.now();
-  if(_lsSizeCache.size !== null && now - _lsSizeCache.ts < 10000) return _lsSizeCache.size;
-  let total = 0;
-  for(let k in localStorage){ if(Object.prototype.hasOwnProperty.call(localStorage, k) && k.startsWith(LS_PRE)) total += (localStorage[k]||'').length; }
-  _lsSizeCache = {size: total, ts: now};
-  return total;
-}
-function lsRead(store){
-  try{ const r=localStorage.getItem(LS_PRE+store); return r?JSON.parse(r):[]; }
-  catch{ return []; }
-}
-function lsWrite(store, arr){
-  try{
-    const data = JSON.stringify(arr);
-    localStorage.setItem(LS_PRE+store, data);
-    _lsSizeCache.size = null; // إبطال الكاش عند كل كتابة فعلية
-    if(lsCalcSize() > 4 * 1024 * 1024) showToast('⚠ البيانات تقترب من حد 5MB - صدّر JSON الآن','error');
-  }catch(e){
-    console.warn('localStorage write failed', e);
-    showToast('⚠ امتلأ التخزين - صدّر بياناتك فوراً عبر تصدير JSON','error');
-  }
-}
-function lsPutItems(store, items){
-  const existing=lsRead(store);
-  const map={};
-  existing.forEach(x=>map[x.id]=x);
-  items.forEach(x=>map[x.id]=x);
-  lsWrite(store, Object.values(map));
-}
-function lsSetCfgKey(key, val){ try{ localStorage.setItem(LS_PRE+'cfg_'+key, val); }catch(e){ console.warn('lsSetCfgKey failed',e); } }
-function lsGetCfgKey(key){ try{ return localStorage.getItem(LS_PRE+'cfg_'+key); }catch{ return null; } }
-function lsClearStore(store){ lsWrite(store,[]); }
-function lsDelWhere(store, pred){ lsWrite(store, lsRead(store).filter(x=>!pred(x))); }
-
-/* --- in-memory backend --- */
-function memPutItems(store, items){
-  const map={};
-  (_mem[store]||[]).forEach(x=>map[x.id]=x);
-  items.forEach(x=>map[x.id]=x);
-  _mem[store]=Object.values(map);
-}
-
-/* --- IndexedDB helpers --- */
-function openDB(){
-  return new Promise((resolve,reject)=>{
-    let settled=false;
-    const done=(fn,v)=>{ if(!settled){settled=true; fn(v); } };
-    const timer=setTimeout(()=>done(reject,new Error('IDB timeout')), 4000);
-    let req;
-    try{ req=indexedDB.open(DB_NAME,1); }
-    catch(e){ clearTimeout(timer); done(reject,e); return; }
-    req.onupgradeneeded = e => {
-      const d=e.target.result;
-      if(!d.objectStoreNames.contains('tx'))     d.createObjectStore('tx',{keyPath:'id'});
-      if(!d.objectStoreNames.contains('files'))  d.createObjectStore('files',{keyPath:'id'});
-      if(!d.objectStoreNames.contains('cfg'))    d.createObjectStore('cfg');
-      if(!d.objectStoreNames.contains('issues')) d.createObjectStore('issues',{keyPath:'id'});
-      if(!d.objectStoreNames.contains('debts'))  d.createObjectStore('debts',{keyPath:'id'});
-    };
-    req.onsuccess = e=>{ clearTimeout(timer); db=e.target.result; done(resolve); };
-    req.onerror   = e=>{ clearTimeout(timer); done(reject,e.target.error); };
-    req.onblocked = () =>{ clearTimeout(timer); done(reject,new Error('IDB blocked by another tab')); };
+async function _apiFetch(path, opts={}){
+  const r = await fetch(API_BASE + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
   });
+  const json = await r.json();
+  if(!r.ok) throw new Error(json.error || r.statusText);
+  return json;
 }
 
-/* --- الدوال الموحدة (IDB / localStorage / in-memory) --- */
-const idbAll = store => {
-  if(storageMode==='mem') return Promise.resolve(_mem[store]||[]);
-  if(storageMode==='ls')  return Promise.resolve(lsRead(store));
-  return new Promise((resolve,reject)=>{
-    const r=db.transaction(store,'readonly').objectStore(store).getAll();
-    r.onsuccess=()=>resolve(r.result); r.onerror=()=>reject(r.error);
+// جلب جميع السجلات من مخزن
+const idbAll = store =>
+  _apiFetch(`/api/store/${store}`).then(j => j.data || []);
+
+// جلب قيمة من cfg
+const idbGet = (store, key) => {
+  if(store === 'cfg') return _apiFetch(`/api/cfg/${key}`).then(j => {
+    const v = j.value;
+    // القيمة مخزّنة كـ JSON، نعيدها كـ string لتتوافق مع الكود الحالي
+    if(v === null || v === undefined) return null;
+    if(typeof v === 'string') return v;
+    return JSON.stringify(v);
   });
+  // لا يُستخدم idbGet مع غير cfg في الكود الحالي
+  return idbAll(store).then(arr => arr.find(x => x.id === key));
 };
-const idbGet = (store,key) => {
-  if(storageMode==='mem') return Promise.resolve(store==='cfg' ? (_mem.cfg[key]||null) : (_mem[store]||[]).find(x=>x.id===key));
-  if(storageMode==='ls')  return Promise.resolve(store==='cfg' ? lsGetCfgKey(key) : lsRead(store).find(x=>x.id===key));
-  return new Promise((resolve,reject)=>{
-    const r=db.transaction(store,'readonly').objectStore(store).get(key);
-    r.onsuccess=()=>resolve(r.result); r.onerror=()=>reject(r.error);
-  });
-};
+
+// إضافة/تحديث سجلات (upsert)
 function idbPutAll(store, items){
-  if(storageMode==='mem'){ memPutItems(store,items); return Promise.resolve(); }
-  if(storageMode==='ls') { lsPutItems(store,items); return Promise.resolve(); }
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,'readwrite');
-    const os=tx.objectStore(store);
-    items.forEach(item=>os.put(item));
-    tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error);
-  });
+  if(!items || !items.length) return Promise.resolve();
+  return _apiFetch(`/api/store/${store}/batch`, { method:'POST', body:{ items } });
 }
+
+// حفظ قيمة في cfg
 function idbPut(store, key, value){
-  if(storageMode==='mem'){ _mem.cfg[key]=value; return Promise.resolve(); }
-  if(storageMode==='ls') { lsSetCfgKey(key,value); return Promise.resolve(); }
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,'readwrite');
-    const os=tx.objectStore(store);
-    const r=os.put(value,key);
-    r.onsuccess=()=>resolve(); r.onerror=()=>reject(r.error);
-  });
+  if(store === 'cfg')
+    return _apiFetch(`/api/cfg/${key}`, { method:'PUT', body:{ value } });
+  return idbPutAll(store, [{ id: key, value }]);
 }
+
+// مسح كامل مخزن
 function idbClear(store){
-  if(storageMode==='mem'){ _mem[store]=[]; return Promise.resolve(); }
-  if(storageMode==='ls') { lsClearStore(store); return Promise.resolve(); }
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,'readwrite');
-    tx.objectStore(store).clear();
-    tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error);
-  });
+  return _apiFetch(`/api/store/${store}`, { method:'DELETE' });
 }
+
+// حذف السجلات التي تطابق شرطاً (يُستخدم فقط بـ fileId أو id في الكود)
 function idbDeleteWhere(store, pred){
-  if(storageMode==='mem'){ _mem[store]=(_mem[store]||[]).filter(x=>!pred(x)); return Promise.resolve(); }
-  if(storageMode==='ls') { lsDelWhere(store,pred); return Promise.resolve(); }
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(store,'readwrite');
-    const os=tx.objectStore(store);
-    const req=os.openCursor();
-    req.onsuccess=e=>{
-      const cursor=e.target.result;
-      if(cursor){ if(pred(cursor.value)) cursor.delete(); cursor.continue(); }
-    };
-    tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error);
+  // نستخرج الـ ids من الذاكرة لتجنب جلب كل البيانات من السيرفر
+  // الكود الحالي يستخدم idbDeleteWhere بعد تحديث المصفوفة في الذاكرة
+  // فنحدد المعرّفات من المصفوفة المحلية المقابلة
+  const localMap = { tx: TX, files: FILES, issues: ISSUES, debts: DEBTS };
+  const arr = localMap[store] || [];
+  const matchIds = arr.filter(pred).map(x => String(x.id));
+  if(!matchIds.length) return Promise.resolve();
+  return _apiFetch(`/api/store/${store}/delete-where`, {
+    method: 'POST',
+    body: { field: 'id', values: matchIds }
   });
 }
 
@@ -1482,8 +1401,7 @@ function renderFilesModal(){
   const manualName = 'إضافات يدوية';
   const manualOk = !q || norm(manualName).includes(q);
   if(manualShow && manualOk){
-    let manualEntries = [];
-    try{ manualEntries = JSON.parse(localStorage.getItem('manual_entries_v1')||'[]'); }catch(e){}
+    let manualEntries = TX.filter(t => t.source === 'manual');
     const mRecv = manualEntries.filter(m=>m.dir==='recv').reduce((s,m)=>s+m.amount,0);
     const mPaid = manualEntries.filter(m=>m.dir==='paid').reduce((s,m)=>s+m.amount,0);
     manualCard = `
@@ -3285,14 +3203,14 @@ function exportXLSX(){
 
   // شيت الإضافات اليدوية
   try{
-    const manualEntries = JSON.parse(localStorage.getItem('manual_entries_v1')||'[]');
+    const manualEntries = TX.filter(t => t.source === 'manual');
     if(manualEntries.length){
       const manualRows = manualEntries.map((m,i)=>({
         '#': i+1,
         'الاسم': m.name,
-        'الاتجاه': m.dir==='recv'?'وارد':'صادر',
-        'وارد (₪)': m.dir==='recv'?m.amount:'',
-        'صادر (₪)': m.dir==='paid'?m.amount:'',
+        'الاتجاه': m.recv!=null?'وارد':'صادر',
+        'وارد (₪)': m.recv!=null?m.recv:'',
+        'صادر (₪)': m.paid!=null?m.paid:'',
         'التاريخ': m.date||'',
         'الساعة': m.time||'',
         'ملاحظة': m.note||'',
@@ -4263,53 +4181,25 @@ function exportAnalyticsXLSX(){
 
 (async function boot(){
   const chip = document.getElementById('dbChip');
+  chip.textContent = '⏳ جارٍ الاتصال...';
+  chip.className = '';
 
-  // الكشف الذكي: هل نحن على سيرفر حقيقي؟
-  // file:// = لابتوب/PC مباشرة
-  // content:// = Android Chrome من مدير الملفات
-  // blob:// = بعض متصفحات الهاتف
-  const proto = location.protocol;
-  const isServerProtocol = (proto === 'http:' || proto === 'https:');
+  try {
+    // اختبر الاتصال بالسيرفر
+    await _apiFetch('/ping');
 
-  // الطبقة الأولى: IDB (فقط على سيرفر)
-  if(isServerProtocol && typeof indexedDB !== 'undefined'){
-    try{
-      await openDB();
-      storageMode = 'idb';
-    }catch(err){
-      console.warn('IDB فشل:', err.message);
-      storageMode = 'ls';
-    }
-  } else {
-    storageMode = 'ls'; // تخطي IDB فوراً على file:// أو content://
-  }
-
-  // الطبقة الثانية: localStorage - اختبر فعلياً هل هو متاح
-  if(storageMode === 'ls' && !isLocalStorageAvailable()){
-    console.warn('localStorage غير متاح (وضع خاص؟)، التحويل إلى الذاكرة');
-    storageMode = 'mem';
-  }
-
-  // حمّل البيانات
-  try{
+    // حمّل البيانات من قاعدة البيانات
     await loadState();
-  }catch(err){
-    console.error('loadState فشل:', err);
-  }
 
-  // اعرض حالة التخزين
-  const labels = {
-    idb: { text:'✓ IndexedDB', title:'يعمل عبر IndexedDB - سيرفر محلي' },
-    ls:  { text:'✓ localStorage', title:'يعمل عبر localStorage - متوافق مع كل المتصفحات' },
-    mem: { text:'⚡ ذاكرة مؤقتة', title:'وضع خاص / incognito - البيانات لن تُحفظ بعد الإغلاق، صدّر JSON قبل الخروج' }
-  };
-  const info = labels[storageMode];
-  chip.textContent = info.text;
-  chip.className = storageMode === 'mem' ? 'err' : 'ok';
-  chip.title = info.title;
-
-  if(storageMode === 'mem'){
-    showToast('⚡ وضع خاص: البيانات مؤقتة - صدّر JSON قبل الإغلاق', 'error');
+    chip.textContent = '✓ قاعدة البيانات';
+    chip.className = 'ok';
+    chip.title = 'متصل بقاعدة بيانات PostgreSQL المركزية';
+  } catch(err) {
+    console.error('فشل الاتصال بالسيرفر:', err);
+    chip.textContent = '❌ خطأ في الاتصال';
+    chip.className = 'err';
+    chip.title = 'تعذّر الاتصال بالخادم أو قاعدة البيانات';
+    showToast('❌ تعذّر الاتصال بقاعدة البيانات - تحقق من الخادم', 'error');
   }
 
   refreshAll();
@@ -4320,18 +4210,24 @@ function exportAnalyticsXLSX(){
 // ══════════════════════════════════════════════════════
 
 (function(){
-  const MANUAL_KEY = 'manual_entries_v1';
+  const CFG_KEY = 'manual_entries';
   let MANUAL = [];
   let manualSelected = new Set();
 
   function loadManual(){
-    try{ MANUAL = JSON.parse(localStorage.getItem(MANUAL_KEY)||'[]'); }
-    catch(e){ MANUAL = []; }
+    return _apiFetch(`/api/cfg/${CFG_KEY}`)
+      .then(j => {
+        const v = j.value;
+        if(Array.isArray(v)) MANUAL = v;
+        else if(typeof v === 'string'){ try{ MANUAL = JSON.parse(v); }catch{ MANUAL = []; } }
+        else MANUAL = [];
+      })
+      .catch(() => { MANUAL = []; });
   }
   function saveManual(){
-    localStorage.setItem(MANUAL_KEY, JSON.stringify(MANUAL));
-    // دمج مع TX العالمي
-    syncManualToTX();
+    return _apiFetch(`/api/cfg/${CFG_KEY}`, { method:'PUT', body:{ value: MANUAL } })
+      .then(() => syncManualToTX())
+      .catch(err => { console.error('saveManual failed', err); syncManualToTX(); });
   }
 
   function syncManualToTX(){
@@ -4363,10 +4259,8 @@ function exportAnalyticsXLSX(){
 
   function genId(){ return 'manual_' + Date.now() + '_' + Math.random().toString(36).slice(2,7); }
 
-  // ── تهيئة ──
-  loadManual();
-  // نؤخر الدمج حتى يُكمَل تهيئة TX
-  setTimeout(syncManualToTX, 600);
+  // ── تهيئة: جلب الإضافات اليدوية من السيرفر ──
+  loadManual().then(() => syncManualToTX());
 
   // ── فتح مودال الإضافة ──
   window.openManualAddModal = function(editId){
@@ -4442,7 +4336,7 @@ function exportAnalyticsXLSX(){
 
   // ── رسم اللوحة ──
   window.renderManualPane = function(){
-    loadManual();
+    loadManual().then(() => {
     manualSelected.clear();
     updateManualBulkBar();
 
@@ -4476,6 +4370,7 @@ function exportAnalyticsXLSX(){
           <button class="danger sm" onclick="deleteSingleManual('${m.id}')">🗑</button>
         </td>
       </tr>`).join('');
+    }); // end loadManual().then
   };
 
   function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
